@@ -1,1 +1,177 @@
+name: Build patched Kodi 21.3 (Android)
 
+# Builds the official Kodi 21.3 "Omega" source for Android with ONE fix applied: a lock in
+# CScriptInvocationManager::ExecuteAsync that stops the crash when several plugin widgets load
+# at once with reuselanguageinvoker on. Produces a 64-bit (arm64-v8a) and a 32-bit (armeabi-v7a)
+# APK, like the official release. UNTESTED: written from Kodi's docs/README.Android.md.
+#
+# Run it from the repo's Actions tab -> "Build patched Kodi 21.3 (Android)" -> Run workflow.
+# The repo must be PUBLIC (free build minutes). A build takes hours. APKs appear under
+# "Artifacts" on the finished run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kodi_tag:
+        description: "Kodi git tag to build"
+        default: "21.3-Omega"
+        required: true
+
+jobs:
+  build:
+    name: Kodi ${{ matrix.abi }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            host: aarch64-linux-android
+          - abi: armeabi-v7a
+            host: arm-linux-androideabi
+    env:
+      NDK_VER: "21.4.7075529"
+      SDK: /home/runner/android-tools/android-sdk-linux
+      TARBALLS: /home/runner/android-tools/xbmc-tarballs
+      DEPENDS: /home/runner/android-tools/xbmc-depends
+
+    steps:
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison build-essential curl flex gawk git gperf \
+            libcurl4-openssl-dev libtool pkg-config python3 unzip zip zlib1g-dev patch rsync xz-utils bzip2 wget
+          sudo apt-get install -y lib32stdc++6 lib32z1 lib32z1-dev || true
+
+      # Keeps the signing key between runs, so a newer build of the same ABI can update an older one
+      # without uninstalling. Saved after the first successful run.
+      - name: Restore debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: kodi-debug-keystore-${{ matrix.abi }}
+
+      - name: Create signing key if none was restored
+        run: |
+          mkdir -p "$HOME/.android"
+          [ -f "$HOME/.android/debug.keystore" ] || keytool -genkey -keystore "$HOME/.android/debug.keystore" -v \
+            -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keypass android -storepass android \
+            -keyalg RSA -keysize 2048 -validity 10000
+
+      - name: Install Android SDK and NDK r21e
+        run: |
+          set -euo pipefail
+          mkdir -p "$SDK"
+          wget -q -O /tmp/cmdline.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdline.zip -d "$SDK"
+          SDKM="$SDK/cmdline-tools/bin/sdkmanager"
+          yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK" platform-tools "platforms;android-34" "build-tools;33.0.1" "ndk;$NDK_VER"
+          ls "$SDK/ndk"
+
+      - name: Get Kodi source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.kodi_tag }}" https://github.com/xbmc/xbmc "$HOME/kodi"
+
+      - name: Apply the fix
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          cat > "$HOME/race_fix.patch" <<'PATCH_EOF'
+          --- a/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+          +++ b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+          @@ -233,6 +233,14 @@
+               return -1;
+             }
+
+          +  // Hold the manager lock from "pick an invoker" until the script is handed to it. The lock
+          +  // is recursive, so GetLanguageInvoker() and the overload below simply re-lock.
+          +  // GetLanguageInvoker() Reset()s a reused invoker, which makes it look "not reusable" to
+          +  // anyone else until it is started. If a second caller gets in between, it Release()s that
+          +  // invoker's thread (the interpreter is then torn down) while this caller starts a NEW
+          +  // thread on the same invoker and runs in the dying interpreter -> crash in python3x.dll.
+          +  // Seen when several plugin widgets load at once with reuselanguageinvoker enabled.
+          +  std::unique_lock<CCriticalSection> lock(m_critSection);
+             LanguageInvokerPtr invoker = GetLanguageInvoker(script);
+             return ExecuteAsync(script, invoker, addon, arguments, reuseable, pluginHandle);
+           }
+          PATCH_EOF
+          F="xbmc/interfaces/generic/ScriptInvocationManager.cpp"
+          if git apply --check --ignore-whitespace "$HOME/race_fix.patch" 2>/dev/null; then
+            git apply --ignore-whitespace "$HOME/race_fix.patch"
+            echo "Patch applied with git."
+          else
+            echo "git apply refused; inserting the line directly."
+            python3 - "$F" <<'PY_EOF'
+          import re, sys
+          p = sys.argv[1]
+          t = open(p, newline='').read()
+          pat = re.compile(r'(?m)^([ \t]*)(LanguageInvokerPtr invoker = GetLanguageInvoker\(script\);\r?\n[ \t]*return ExecuteAsync\(script, invoker, addon, arguments, reuseable, pluginHandle\);)')
+          m = pat.search(t)
+          if not m or len(pat.findall(t)) != 1:
+              sys.exit("could not find the one place to patch")
+          ind = m.group(1)
+          add = (ind + "// Hold the manager lock from \"pick an invoker\" until the script is handed to it (recursive lock);\n" +
+                 ind + "// otherwise a second caller can release the reused invoker's thread mid-start -> crash.\n" +
+                 ind + "std::unique_lock<CCriticalSection> lock(m_critSection);\n")
+          t = t[:m.start()] + add + t[m.start():]
+          open(p, 'w', newline='').write(t)
+          PY_EOF
+          fi
+          grep -q "Hold the manager lock from" "$F" && grep -q "std::unique_lock<CCriticalSection> lock(m_critSection);" "$F" \
+            || { echo "The fix is NOT in the source file; stopping."; exit 1; }
+          grep -n -B2 -A3 "Hold the manager lock from" "$F" | head -20
+
+      - name: Build Kodi dependencies (the long step)
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi/tools/depends"
+          ./bootstrap
+          ./configure --with-tarballs="$TARBALLS" --host=${{ matrix.host }} --with-sdk-path="$SDK" \
+            --with-ndk-path="$SDK/ndk/$NDK_VER" --prefix="$DEPENDS"
+          make -j"$(nproc)"
+
+      - name: Build Kodi and package the APK
+        run: |
+          set -euo pipefail
+          touch "$HOME/.build_started"
+          cd "$HOME/kodi"
+          mkdir -p "$HOME/kodi-build"
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$HOME/kodi-build"
+          cd "$HOME/kodi-build"
+          make -j"$(nproc)"
+          make apk
+
+      - name: Collect the APK
+        run: |
+          set -euo pipefail
+          APK=$(find "$HOME/kodi-build" "$HOME/kodi" -name '*.apk' -newer "$HOME/.build_started" 2>/dev/null | grep -vi unaligned | head -1 || true)
+          [ -n "$APK" ] || APK=$(find "$HOME/kodi-build" "$HOME/kodi" -name '*.apk' 2>/dev/null | head -1 || true)
+          [ -n "$APK" ] || { echo "No APK found"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$APK" "$GITHUB_WORKSPACE/out/Kodi-${{ inputs.kodi_tag }}-patched-${{ matrix.abi }}.apk"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kodi-${{ inputs.kodi_tag }}-patched-${{ matrix.abi }}
+          path: out/*.apk
+          retention-days: 30
+          if-no-files-found: error
