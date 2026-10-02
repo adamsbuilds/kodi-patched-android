@@ -1,0 +1,304 @@
+name: Build patched Kodi 21.3 (Android)
+
+# Builds the official Kodi 21.3 "Omega" source for Android with THREE small fixes for plugin widgets
+# loading at once with reuselanguageinvoker on: (1) a lock in CScriptInvocationManager::ExecuteAsync
+# that stops the crash, (2) a one-line change in CLanguageInvokerThread::Process so a queued call is
+# not silently dropped, (3) RunningScriptsHandler no longer hands one plugin handle to two running
+# calls (a widget came up empty). It is built as an optimized Release APK (--enable-debug=no). Produces a 64-bit (arm64-v8a) and a 32-bit (armeabi-v7a)
+# APK, like the official release. UNTESTED: written from Kodi's docs/README.Android.md.
+#
+# This signs with the same saved key as the Kodi 22 workflow, so builds of the same ABI can update each other.
+#
+# Run it from the repo's Actions tab -> "Build patched Kodi 21.3 (Android)" -> Run workflow.
+# The repo must be PUBLIC (free build minutes). A build takes hours. APKs appear under
+# "Artifacts" on the finished run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kodi_tag:
+        description: "Kodi git tag to build"
+        default: "21.3-Omega"
+        required: true
+
+jobs:
+  build:
+    name: Kodi ${{ matrix.abi }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            host: aarch64-linux-android
+          - abi: armeabi-v7a
+            host: arm-linux-androideabi
+    env:
+      NDK_VER: "21.4.7075529"
+      SDK: /home/runner/android-tools/android-sdk-linux
+      TARBALLS: /home/runner/android-tools/xbmc-tarballs
+      DEPENDS: /home/runner/android-tools/xbmc-depends
+
+    steps:
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison build-essential curl flex gawk git gperf \
+            libcurl4-openssl-dev libtool pkg-config python3 unzip zip zlib1g-dev patch rsync xz-utils bzip2 wget
+          sudo apt-get install -y lib32stdc++6 lib32z1 lib32z1-dev || true
+
+      # Keeps the signing key between runs, so a newer build of the same ABI can update an older one
+      # without uninstalling. Saved after the first successful run.
+      - name: Restore debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: kodi-debug-keystore-${{ matrix.abi }}
+
+      - name: Create signing key if none was restored
+        run: |
+          mkdir -p "$HOME/.android"
+          [ -f "$HOME/.android/debug.keystore" ] || keytool -genkey -keystore "$HOME/.android/debug.keystore" -v \
+            -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keypass android -storepass android \
+            -keyalg RSA -keysize 2048 -validity 10000
+
+      - name: Install Android SDK and NDK r21e
+        run: |
+          set -euo pipefail
+          mkdir -p "$SDK"
+          wget -q -O /tmp/cmdline.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdline.zip -d "$SDK"
+          SDKM="$SDK/cmdline-tools/bin/sdkmanager"
+          yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK" platform-tools "platforms;android-34" "build-tools;33.0.1" "ndk;$NDK_VER"
+          ls "$SDK/ndk"
+
+      - name: Get Kodi source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.kodi_tag }}" https://github.com/xbmc/xbmc "$HOME/kodi"
+
+      - name: Apply the fixes
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          cat > "$HOME/race_fix1.patch" <<'PATCH1_EOF'
+          --- a/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+          +++ b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+          @@ -233,6 +233,14 @@
+               return -1;
+             }
+
+          +  // Hold the manager lock from "pick an invoker" until the script is handed to it. The lock
+          +  // is recursive, so GetLanguageInvoker() and the overload below simply re-lock.
+          +  // GetLanguageInvoker() Reset()s a reused invoker, which makes it look "not reusable" to
+          +  // anyone else until it is started. If a second caller gets in between, it Release()s that
+          +  // invoker's thread (the interpreter is then torn down) while this caller starts a NEW
+          +  // thread on the same invoker and runs in the dying interpreter -> crash in python3x.dll.
+          +  // Seen when several plugin widgets load at once with reuselanguageinvoker enabled.
+          +  std::unique_lock<CCriticalSection> lock(m_critSection);
+             LanguageInvokerPtr invoker = GetLanguageInvoker(script);
+             return ExecuteAsync(script, invoker, addon, arguments, reuseable, pluginHandle);
+           }
+          PATCH1_EOF
+          cat > "$HOME/race_fix2.patch" <<'PATCH2_EOF'
+          --- a/xbmc/interfaces/generic/LanguageInvokerThread.cpp
+          +++ b/xbmc/interfaces/generic/LanguageInvokerThread.cpp
+          @@ -109,9 +109,12 @@
+               if (m_invoker->GetState() != InvokerStateScriptDone)
+                 m_reusable = false;
+
+          +    // A caller can queue a restart (m_restart) and then another caller can Release() this thread
+          +    // (m_bStop) before it wakes up. Run the queued script anyway; with the old condition it was
+          +    // silently dropped and that plugin call failed ("GetDirectory - Error getting plugin://...").
+               m_condition.wait(lckdl, [this] { return m_bStop || m_restart || !m_reusable; });
+
+          -  } while (m_reusable && !m_bStop);
+          +  } while (m_reusable && (!m_bStop || m_restart));
+           }
+
+           void CLanguageInvokerThread::OnExit()
+          PATCH2_EOF
+          cat > "$HOME/race_fix3.patch" <<'PATCH3_EOF'
+          --- a/xbmc/interfaces/generic/RunningScriptsHandler.h
+          +++ b/xbmc/interfaces/generic/RunningScriptsHandler.h
+          @@ -41,10 +41,12 @@
+
+               // reuse an existing script handle or get a new one if necessary
+               int handle = CScriptInvocationManager::GetInstance().GetReusablePluginHandle(addon->LibPath());
+          -    if (handle < 0)
+          +    // Two callers starting at the same moment are both offered the same reusable handle (the invoker
+          +    // is only claimed later). ReuseScriptHandle() refuses it while another running script holds it, so
+          +    // each call gets its own handle and one call's results are no longer lost or mixed into the other's
+          +    // ("GetDirectory - Error getting plugin://..." or an empty widget).
+          +    if (handle < 0 || !ReuseScriptHandle(handle, script))
+                 handle = GetNewScriptHandle(script);
+          -    else
+          -      ReuseScriptHandle(handle, script);
+
+               // run the script
+               auto result = CScriptRunner::RunScript(addon, path, handle, resume);
+          @@ -64,10 +66,14 @@
+               return handle;
+             }
+
+          -  static void ReuseScriptHandle(HandleType handle, TScript* script)
+          +  static bool ReuseScriptHandle(HandleType handle, TScript* script)
+             {
+               std::unique_lock<CCriticalSection> lock(s_critical);
+          +    const auto it = s_scriptHandles.find(handle);
+          +    if (it != s_scriptHandles.end() && it->second != script)
+          +      return false; // still held by another running script
+               s_scriptHandles[handle] = script;
+          +    return true;
+             }
+
+             static void RemoveScriptHandle(HandleType handle)
+          PATCH3_EOF
+          F1="xbmc/interfaces/generic/ScriptInvocationManager.cpp"
+          F2="xbmc/interfaces/generic/LanguageInvokerThread.cpp"
+          F3="xbmc/interfaces/generic/RunningScriptsHandler.h"
+
+          # Fix 1: hold the manager lock from "pick an invoker" until the script is handed to it.
+          if git apply --check --ignore-whitespace "$HOME/race_fix1.patch" 2>/dev/null; then
+            git apply --ignore-whitespace "$HOME/race_fix1.patch"
+            echo "Fix 1 applied with git."
+          else
+            echo "git apply refused fix 1; inserting the line directly."
+            python3 - "$F1" <<'PY1_EOF'
+          import re, sys
+          p = sys.argv[1]
+          t = open(p, newline='').read()
+          pat = re.compile(r'(?m)^([ \t]*)(LanguageInvokerPtr invoker = GetLanguageInvoker\(script\);\r?\n[ \t]*return ExecuteAsync\(script, invoker, addon, arguments, reuseable, pluginHandle\);)')
+          m = pat.search(t)
+          if not m or len(pat.findall(t)) != 1:
+              sys.exit("could not find the one place to patch")
+          ind = m.group(1)
+          add = (ind + "// Hold the manager lock from \"pick an invoker\" until the script is handed to it (recursive lock);\n" +
+                 ind + "// otherwise a second caller can release the reused invoker's thread mid-start -> crash.\n" +
+                 ind + "std::unique_lock<CCriticalSection> lock(m_critSection);\n")
+          t = t[:m.start()] + add + t[m.start():]
+          open(p, 'w', newline='').write(t)
+          PY1_EOF
+          fi
+
+          # Fix 2: a restart queued on a reused thread must still run if the thread is released right after.
+          if git apply --check --ignore-whitespace "$HOME/race_fix2.patch" 2>/dev/null; then
+            git apply --ignore-whitespace "$HOME/race_fix2.patch"
+            echo "Fix 2 applied with git."
+          else
+            echo "git apply refused fix 2; editing the line directly."
+            python3 - "$F2" <<'PY2_EOF'
+          import sys
+          p = sys.argv[1]
+          t = open(p, newline='').read()
+          old = "} while (m_reusable && !m_bStop);"
+          if t.count(old) != 1:
+              sys.exit("could not find the one place to patch")
+          open(p, 'w', newline='').write(t.replace(old, "} while (m_reusable && (!m_bStop || m_restart));"))
+          PY2_EOF
+          fi
+
+          # Fix 3: never give one plugin handle to two running calls (one widget's results were being lost).
+          if git apply --check --ignore-whitespace "$HOME/race_fix3.patch" 2>/dev/null; then
+            git apply --ignore-whitespace "$HOME/race_fix3.patch"
+            echo "Fix 3 applied with git."
+          else
+            echo "git apply refused fix 3; editing the file directly."
+            python3 - "$F3" <<'PY3_EOF'
+          import sys
+          p = sys.argv[1]
+          t = open(p, newline='').read()
+          old_call = """    if (handle < 0)
+                handle = GetNewScriptHandle(script);
+              else
+                ReuseScriptHandle(handle, script);
+          """
+          new_call = """    // ReuseScriptHandle() refuses a handle another running script holds (still held by another running script).
+              if (handle < 0 || !ReuseScriptHandle(handle, script))
+                handle = GetNewScriptHandle(script);
+          """
+          old_fn = """  static void ReuseScriptHandle(HandleType handle, TScript* script)
+            {
+              std::unique_lock<CCriticalSection> lock(s_critical);
+              s_scriptHandles[handle] = script;
+            }
+          """
+          new_fn = """  static bool ReuseScriptHandle(HandleType handle, TScript* script)
+            {
+              std::unique_lock<CCriticalSection> lock(s_critical);
+              const auto it = s_scriptHandles.find(handle);
+              if (it != s_scriptHandles.end() && it->second != script)
+                return false; // still held by another running script
+              s_scriptHandles[handle] = script;
+              return true;
+            }
+          """
+          if t.count(old_call) != 1 or t.count(old_fn) != 1:
+              sys.exit("could not find the places to patch")
+          open(p, 'w', newline='').write(t.replace(old_call, new_call).replace(old_fn, new_fn))
+          PY3_EOF
+          fi
+
+          grep -q "std::unique_lock<CCriticalSection> lock(m_critSection);" "$F1" && grep -q "Hold the manager lock from" "$F1" \
+            || { echo "Fix 1 is NOT in the source; stopping."; exit 1; }
+          grep -q "(!m_bStop || m_restart)" "$F2" \
+            || { echo "Fix 2 is NOT in the source; stopping."; exit 1; }
+          grep -q "still held by another running script" "$F3" \
+            || { echo "Fix 3 is NOT in the source; stopping."; exit 1; }
+          grep -n -B2 -A3 "Hold the manager lock from" "$F1" | head -20
+          grep -n "m_bStop || m_restart" "$F2"
+
+      - name: Build Kodi dependencies (the long step)
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi/tools/depends"
+          ./bootstrap
+          # --enable-debug=no gives an optimized Release build like the official APKs (the default is a Debug build).
+          ./configure --with-tarballs="$TARBALLS" --host=${{ matrix.host }} --with-sdk-path="$SDK" \
+            --with-ndk-path="$SDK/ndk/$NDK_VER" --prefix="$DEPENDS" --enable-debug=no
+          make -j"$(nproc)"
+
+      - name: Build Kodi and package the APK
+        run: |
+          set -euo pipefail
+          touch "$HOME/.build_started"
+          cd "$HOME/kodi"
+          mkdir -p "$HOME/kodi-build"
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$HOME/kodi-build"
+          cd "$HOME/kodi-build"
+          make -j"$(nproc)"
+          make apk
+
+      - name: Collect the APK
+        run: |
+          set -euo pipefail
+          APK=$(find "$HOME/kodi-build" "$HOME/kodi" -name '*.apk' -newer "$HOME/.build_started" 2>/dev/null | grep -vi unaligned | head -1 || true)
+          [ -n "$APK" ] || APK=$(find "$HOME/kodi-build" "$HOME/kodi" -name '*.apk' 2>/dev/null | head -1 || true)
+          [ -n "$APK" ] || { echo "No APK found"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$APK" "$GITHUB_WORKSPACE/out/Kodi-${{ inputs.kodi_tag }}-patched-${{ matrix.abi }}.apk"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kodi-${{ inputs.kodi_tag }}-patched-${{ matrix.abi }}
+          path: out/*.apk
+          retention-days: 30
+          if-no-files-found: error
